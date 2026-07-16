@@ -2393,3 +2393,221 @@ def test_dashboard_failed_card_highlight_class_exists():
     assert "hermes-kanban-card--failed" in js
     assert "hermes-kanban-card--failed" in css
     assert "failedIds" in js
+
+
+# ---------------------------------------------------------------------------
+# Attachments
+# ---------------------------------------------------------------------------
+
+
+def test_attachment_round_trip_sanitizes_collisions_and_deletes(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "attachment owner"}
+    ).json()["task"]
+    url = f"/api/plugins/kanban/tasks/{task['id']}/attachments"
+
+    first = client.post(
+        url,
+        files={"file": ("../report.txt", b"first", "text/plain")},
+        data={"uploaded_by": "tester"},
+    )
+    assert first.status_code == 200, first.text
+    first_attachment = first.json()["attachment"]
+    assert first_attachment["filename"] == "report.txt"
+    assert first_attachment["size"] == 5
+    assert first_attachment["uploaded_by"] == "tester"
+
+    second = client.post(
+        url,
+        files={"file": ("report.txt", b"second", "text/plain")},
+    )
+    assert second.status_code == 200, second.text
+    second_attachment = second.json()["attachment"]
+    assert second_attachment["filename"] == "report (1).txt"
+
+    listed = client.get(url)
+    assert listed.status_code == 200
+    assert [item["filename"] for item in listed.json()["attachments"]] == [
+        "report.txt",
+        "report (1).txt",
+    ]
+
+    downloaded = client.get(
+        f"/api/plugins/kanban/attachments/{first_attachment['id']}"
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"first"
+    assert downloaded.headers["content-type"].startswith("text/plain")
+
+    deleted = client.delete(
+        f"/api/plugins/kanban/attachments/{first_attachment['id']}"
+    )
+    assert deleted.status_code == 200
+    assert deleted.json() == {"ok": True, "id": first_attachment["id"]}
+    assert client.get(
+        f"/api/plugins/kanban/attachments/{first_attachment['id']}"
+    ).status_code == 404
+
+
+def test_attachment_endpoints_reject_invalid_or_missing_records(client):
+    missing_task_url = "/api/plugins/kanban/tasks/t_missing/attachments"
+    assert client.get(missing_task_url).status_code == 404
+    assert client.post(
+        missing_task_url,
+        files={"file": ("report.txt", b"data", "text/plain")},
+    ).status_code == 404
+
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "attachment owner"}
+    ).json()["task"]
+    task_url = f"/api/plugins/kanban/tasks/{task['id']}/attachments"
+    invalid = client.post(
+        task_url,
+        files={"file": ("...", b"data", "application/octet-stream")},
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "invalid attachment filename"
+    assert client.get("/api/plugins/kanban/attachments/999999").status_code == 404
+    assert client.delete("/api/plugins/kanban/attachments/999999").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Orchestration settings (isolated HERMES_HOME fixture; no live config writes)
+# ---------------------------------------------------------------------------
+
+
+def test_orchestration_settings_round_trip_without_enabling_auto_decompose(client):
+    initial = client.get("/api/plugins/kanban/orchestration")
+    assert initial.status_code == 200
+    assert initial.json()["auto_decompose"] is True
+
+    updated = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={
+            "orchestrator_profile": "",
+            "default_assignee": "",
+            "auto_decompose": False,
+            "auto_promote_children": False,
+        },
+    )
+    assert updated.status_code == 200, updated.text
+    body = updated.json()
+    assert body["orchestrator_profile"] == ""
+    assert body["default_assignee"] == ""
+    assert body["auto_decompose"] is False
+    assert body["auto_promote_children"] is False
+    assert body["resolved_orchestrator_profile"]
+    assert body["resolved_default_assignee"]
+
+
+def test_orchestration_settings_reject_unknown_profile(client):
+    response = client.put(
+        "/api/plugins/kanban/orchestration",
+        json={"orchestrator_profile": "definitely-not-a-real-profile"},
+    )
+    assert response.status_code == 400
+    assert "does not exist" in response.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Worker visibility
+# ---------------------------------------------------------------------------
+
+
+def test_active_workers_and_direct_run_lookup(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "visible worker", "assignee": "developer"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        claimed = kb.claim_task(conn, task["id"], claimer="dashboard-test")
+        assert claimed is not None
+        kb._set_worker_pid(conn, task["id"], os.getpid())
+        claimed = kb.get_task(conn, task["id"])
+        assert claimed is not None
+        run_id = claimed.current_run_id
+    finally:
+        conn.close()
+
+    active = client.get("/api/plugins/kanban/workers/active")
+    assert active.status_code == 200
+    body = active.json()
+    assert body["count"] == 1
+    assert body["checked_at"] > 0
+    worker = body["workers"][0]
+    assert worker["run_id"] == run_id
+    assert worker["task_id"] == task["id"]
+    assert worker["task_title"] == "visible worker"
+    assert worker["task_status"] == "running"
+    assert worker["task_assignee"] == "developer"
+    assert worker["profile"] == "developer"
+    assert worker["worker_pid"] == os.getpid()
+    assert worker["claim_lock"] == "dashboard-test"
+
+    run = client.get(f"/api/plugins/kanban/runs/{run_id}")
+    assert run.status_code == 200
+    assert run.json()["run"]["task_id"] == task["id"]
+    assert client.get("/api/plugins/kanban/runs/999999").status_code == 404
+
+
+def test_stats_assignees_and_worker_log_endpoints(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "dashboard stats", "assignee": "developer"},
+    ).json()["task"]
+
+    stats = client.get("/api/plugins/kanban/stats")
+    assert stats.status_code == 200
+    assert stats.json()["by_status"]["ready"] == 1
+
+    assignees = client.get("/api/plugins/kanban/assignees")
+    assert assignees.status_code == 200
+    assert any(item["name"] == "developer" for item in assignees.json()["assignees"])
+
+    no_log = client.get(f"/api/plugins/kanban/tasks/{task['id']}/log?tail=10")
+    assert no_log.status_code == 200
+    assert no_log.json()["exists"] is False
+    assert no_log.json()["content"] == ""
+    assert client.get("/api/plugins/kanban/tasks/t_missing/log").status_code == 404
+
+
+def test_board_crud_endpoints_in_isolated_home(client):
+    created = client.post(
+        "/api/plugins/kanban/boards",
+        json={
+            "slug": "review-sandbox",
+            "name": "Review Sandbox",
+            "description": "temporary test board",
+            "switch": True,
+        },
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["board"]["slug"] == "review-sandbox"
+    assert created.json()["current"] == "review-sandbox"
+
+    listed = client.get("/api/plugins/kanban/boards")
+    assert listed.status_code == 200
+    board = next(
+        item for item in listed.json()["boards"] if item["slug"] == "review-sandbox"
+    )
+    assert board["is_current"] is True
+    assert board["counts"] == {}
+    assert board["total"] == 0
+    assert board["default_workspace_kind"] == "scratch"
+
+    renamed = client.patch(
+        "/api/plugins/kanban/boards/review-sandbox",
+        json={"name": "Renamed Sandbox", "color": "#123456"},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["board"]["name"] == "Renamed Sandbox"
+
+    switched = client.post("/api/plugins/kanban/boards/default/switch")
+    assert switched.status_code == 200
+    assert switched.json()["current"] == "default"
+
+    archived = client.delete("/api/plugins/kanban/boards/review-sandbox")
+    assert archived.status_code == 200
+    assert archived.json()["result"]["action"] == "archived"
