@@ -88,6 +88,34 @@ def test_scoped_tui_lock_detects_tui_dependency_map_skew(
     assert main_mod._tui_need_npm_install(tui_dir) is True
 
 
+def test_scoped_tui_lock_detects_missing_required_tui_package(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = _write_scoped_tui_locks(tmp_path, include_unrelated=False)
+    marker_path = tmp_path / "node_modules" / ".package-lock.json"
+    installed = json.loads(marker_path.read_text())
+    del installed["packages"]["node_modules/react"]
+    marker_path.write_text(json.dumps(installed))
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
+def test_scoped_tui_lock_ignores_represented_unrelated_workspace_skew(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = _write_scoped_tui_locks(tmp_path, include_unrelated=True)
+    marker_path = tmp_path / "node_modules" / ".package-lock.json"
+    installed = json.loads(marker_path.read_text())
+    installed["packages"]["apps/bootstrap-installer"] = {
+        "name": "@hermes/bootstrap-installer",
+        "version": "0.9.0",
+        "dependencies": {"electron": "0.9.0"},
+    }
+    marker_path.write_text(json.dumps(installed))
+
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
 def _assert_utf8_replace_capture(kwargs: dict) -> None:
     assert kwargs["text"] is True
     assert kwargs["encoding"] == "utf-8"

@@ -1683,8 +1683,8 @@ def _tui_need_npm_install(root: Path) -> bool:
     For a standalone TUI, each required entry in the root lock must exist in
     the hidden lock. For a TUI inside the repository workspace, npm installs
     only ``--workspace ui-tui``; unrelated workspace entries are therefore
-    expected to be absent. In that scoped layout, compare entries represented
-    in the hidden lock plus the TUI workspace and ``@hermes/ink`` sentinels.
+    expected to be absent or stale. In that scoped layout, compare only the
+    dependency closure rooted at the TUI workspace.
       - a required in-scope entry missing from hidden lock → reinstall (entries
         marked ``optional`` or ``peer`` may be intentionally skipped per platform)
       - present but with differing fields (excluding npm-written runtime
@@ -1725,15 +1725,77 @@ def _tui_need_npm_install(root: Path) -> bool:
     def comparable(pkg: dict) -> dict:
         return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
 
-    scoped_required: frozenset[str] | None = None
+    scoped_required: set[str] | None = None
     if ws_root != root:
         workspace_package = root.relative_to(ws_root).as_posix()
-        scoped_required = frozenset(
-            {workspace_package, "node_modules/@hermes/ink"}
-        )
+        scoped_required = set()
+        pending = [workspace_package]
+
+        def resolve_dependency(package_name: str, dependency: str) -> str | None:
+            """Resolve an npm lock package key using Node's ancestor lookup."""
+            candidates = []
+            if package_name:
+                candidates.append(f"{package_name}/node_modules/{dependency}")
+
+            ancestor = package_name
+            while ancestor:
+                if "/node_modules/" in ancestor:
+                    ancestor = ancestor.rsplit("/node_modules/", 1)[0]
+                elif ancestor.startswith("node_modules/"):
+                    ancestor = ""
+                else:
+                    ancestor = ancestor.rpartition("/")[0]
+                candidate = (
+                    f"{ancestor}/node_modules/{dependency}"
+                    if ancestor
+                    else f"node_modules/{dependency}"
+                )
+                if candidate not in candidates:
+                    candidates.append(candidate)
+
+            for candidate in candidates:
+                if candidate in wanted:
+                    return candidate
+            return None
+
+        while pending:
+            name = pending.pop()
+            if name in scoped_required:
+                continue
+            pkg = wanted.get(name)
+            if not isinstance(pkg, dict):
+                continue
+            scoped_required.add(name)
+
+            resolved = pkg.get("resolved")
+            if pkg.get("link") and isinstance(resolved, str) and resolved in wanted:
+                pending.append(resolved)
+
+            dependency_fields = ["dependencies", "optionalDependencies"]
+            if name == workspace_package:
+                dependency_fields.append("devDependencies")
+            peer_meta = pkg.get("peerDependenciesMeta")
+            for field in (*dependency_fields, "peerDependencies"):
+                dependencies = pkg.get(field)
+                if not isinstance(dependencies, dict):
+                    continue
+                for dependency in dependencies:
+                    if (
+                        field == "peerDependencies"
+                        and isinstance(peer_meta, dict)
+                        and isinstance(peer_meta.get(dependency), dict)
+                        and peer_meta[dependency].get("optional")
+                    ):
+                        continue
+                    dependency_package = resolve_dependency(name, dependency)
+                    if dependency_package is not None:
+                        pending.append(dependency_package)
 
     for name, pkg in wanted.items():
         if not name:
+            continue
+
+        if scoped_required is not None and name not in scoped_required:
             continue
 
         if not isinstance(pkg, dict):
@@ -1741,8 +1803,6 @@ def _tui_need_npm_install(root: Path) -> bool:
 
         if name not in installed:
             if pkg.get("optional") or pkg.get("peer"):
-                continue
-            if scoped_required is not None and name not in scoped_required:
                 continue
             return True
 
