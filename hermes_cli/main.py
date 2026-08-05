@@ -1680,9 +1680,13 @@ def _tui_need_npm_install(root: Path) -> bool:
     already match, which used to trigger a spurious "Installing TUI
     dependencies" on every launch.
 
-    For each entry in the root lock's ``packages`` map:
-      - missing from hidden lock → reinstall (unless the entry is marked
-        ``optional`` or ``peer``, which npm may intentionally skip per platform)
+    For a standalone TUI, each required entry in the root lock must exist in
+    the hidden lock. For a TUI inside the repository workspace, npm installs
+    only ``--workspace ui-tui``; unrelated workspace entries are therefore
+    expected to be absent. In that scoped layout, compare entries represented
+    in the hidden lock plus the TUI workspace and ``@hermes/ink`` sentinels.
+      - a required in-scope entry missing from hidden lock → reinstall (entries
+        marked ``optional`` or ``peer`` may be intentionally skipped per platform)
       - present but with differing fields (excluding npm-written runtime
         annotations like ``ideallyInert``) → reinstall
 
@@ -1721,6 +1725,13 @@ def _tui_need_npm_install(root: Path) -> bool:
     def comparable(pkg: dict) -> dict:
         return {k: v for k, v in pkg.items() if k not in _NPM_LOCK_RUNTIME_KEYS}
 
+    scoped_required: frozenset[str] | None = None
+    if ws_root != root:
+        workspace_package = root.relative_to(ws_root).as_posix()
+        scoped_required = frozenset(
+            {workspace_package, "node_modules/@hermes/ink"}
+        )
+
     for name, pkg in wanted.items():
         if not name:
             continue
@@ -1730,6 +1741,8 @@ def _tui_need_npm_install(root: Path) -> bool:
 
         if name not in installed:
             if pkg.get("optional") or pkg.get("peer"):
+                continue
+            if scoped_required is not None and name not in scoped_required:
                 continue
             return True
 

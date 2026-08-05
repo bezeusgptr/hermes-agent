@@ -1,5 +1,6 @@
 """_tui_need_npm_install: auto npm when node_modules is behind the lockfile."""
 
+import json
 import os
 import types
 from pathlib import Path
@@ -24,6 +25,67 @@ def _touch_tui_entry(root: Path) -> None:
     entry = root / "dist" / "entry.js"
     entry.parent.mkdir(parents=True, exist_ok=True)
     entry.write_text("console.log('tui')")
+
+
+def _write_scoped_tui_locks(root: Path, *, include_unrelated: bool) -> Path:
+    tui_dir = root / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text('{"name":"hermes-tui"}')
+    _touch_ink(root)
+
+    tui_packages = {
+        "ui-tui": {
+            "name": "hermes-tui",
+            "version": "0.0.1",
+            "dependencies": {
+                "@hermes/ink": "file:./packages/hermes-ink",
+                "react": "19.0.0",
+            },
+        },
+        "ui-tui/packages/hermes-ink": {
+            "name": "@hermes/ink",
+            "version": "0.0.1",
+            "dependencies": {"react": "19.0.0"},
+        },
+        "node_modules/@hermes/ink": {
+            "resolved": "ui-tui/packages/hermes-ink",
+            "link": True,
+        },
+        "node_modules/react": {"version": "19.0.0"},
+    }
+    wanted = {"": {"name": "root", "workspaces": ["apps/*", "ui-tui"]}, **tui_packages}
+    if include_unrelated:
+        wanted["apps/bootstrap-installer"] = {
+            "name": "@hermes/bootstrap-installer",
+            "version": "1.0.0",
+            "dependencies": {"electron": "1.0.0"},
+        }
+
+    (root / "package-lock.json").write_text(json.dumps({"packages": wanted}))
+    (root / "node_modules" / ".package-lock.json").write_text(
+        json.dumps({"packages": tui_packages})
+    )
+    return tui_dir
+
+
+def test_scoped_tui_lock_ignores_unrelated_omitted_workspace(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = _write_scoped_tui_locks(tmp_path, include_unrelated=True)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
+def test_scoped_tui_lock_detects_tui_dependency_map_skew(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = _write_scoped_tui_locks(tmp_path, include_unrelated=False)
+    lock_path = tmp_path / "package-lock.json"
+    wanted = json.loads(lock_path.read_text())
+    wanted["packages"]["ui-tui"]["dependencies"]["react"] = "19.1.0"
+    lock_path.write_text(json.dumps(wanted))
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
 
 
 def _assert_utf8_replace_capture(kwargs: dict) -> None:
